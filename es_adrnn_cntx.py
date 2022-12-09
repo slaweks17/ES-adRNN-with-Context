@@ -1,9 +1,11 @@
 '''
 Contextually Enhanced ES-dRNN with Dynamic Attention for Short-Term Load Forecasting
 
-Created in Sep, 2022, this github version in Nov 2022.
+Created in Sep, 2022, this github version in Nov, Dec 2022.
 @author: Slawek Smyl
 internal version no: 198 (193)
+not resetting gradient of per series trainers bug fix, adding epoch to the key while outputting car importance -> ver 199 in Dec 2022
+
 
 The program is meant to save forecasts to a database. Table creation, query and export scripts are listed at the end of this file.
 If using ODBC, you also need to create DSN=slawek
@@ -74,6 +76,7 @@ import pickle
 import numpy as np
 import pandas as pd
 import sys
+import warnings
 pd.set_option('display.max_rows',50_000)
 pd.set_option('display.max_columns', 400)
 pd.set_option('display.width',200)
@@ -100,25 +103,27 @@ DEBUG_AUTOGRAD_ANOMALIES=False
 torch.autograd.set_detect_anomaly(DEBUG_AUTOGRAD_ANOMALIES)
 
 #   T193 EPOCH_POW=0.8 context=3 [S3[2],S3[4],S3[7]] 150,70 [0.525,0.045,0.975] LR=3e-3 {6:/3,7:/10,8:/30} batch=2 {4:5}
-RUN='198e EPOCH_POW=0.8 context=3 [S3[2],S3[4],S3[7]] 150,70 [0.525,0.045,0.975] LR=3e-3 {6:/3,7:/10,8:/30} batch=2 {4:5}'
-RUN_SHORT=RUN[:7]
+RUN='199 PER_SERIES_MULTIP=30 EPOCH_POW=0.8 context=3 [S3[2],S3[4],S3[7]] 150,70 [0.525,0.045,0.975] LR=3e-3 {6:/3,7:/10,8:/30} batch=2 {4:5}'
+SHORT_RUN=RUN[:7]
+SHORT_RUN=SHORT_RUN.replace(' ','_')
   
-FINAL=False
+FINAL=True
 if FINAL:
   print('Testing mode')
   RUN='T'+RUN
-  RUN_SHORT='T'+RUN_SHORT
+  SHORT_RUN='T'+SHORT_RUN
   NUM_OF_EPOCHS=8
 else:
   BEGIN_VALIDATION_TS=dt.datetime(2016,1,1)  #validation up to end of 2017
   print('Validation mode')
   RUN='V'+RUN
-  RUN_SHORT='V'+RUN_SHORT
+  SHORT_RUN='V'+SHORT_RUN
   NUM_OF_EPOCHS=10
 
 DEBUG=False
 if DEBUG:
   RUN='d'+RUN
+  SHORT_RUN='d'+SHORT_RUN
   print('Debug mode')
   
 SAVE_NETS=False
@@ -126,6 +131,7 @@ SAVE_VAR_IMPORTANCE=False
 SAVE_CONTEXT_MODIFIERS=False
 SAVE_CONTEXT_SERIES=False
 FIRST_EPOCH_TO_SAVE_NETS=4
+FIRST_EPOCH_TO_SAVE_IMPORTANCE=FIRST_EPOCH_TO_SAVE_NETS
 FIRST_EPOCH_TO_START_SAVING_FORECASTS=4
 
 CONTEXT_SIZE_PER_SERIES=3
@@ -155,6 +161,7 @@ saveVarImportance=SAVE_VAR_IMPORTANCE and CELLS_NAME[0]=="S3Cell"
 SAVE_TEST_EVERY_STEP=1  
 PI_WEIGHT=0.3
 INITIAL_LEARNING_RATE=3e-3
+PER_SERIES_MULTIP=30
 NUM_OF_TRAINING_STEPS=50
 
 STEP_SIZE=24
@@ -900,32 +907,34 @@ def validationLossFunc(forec, actuals, maseNormalizer):
   
   #center
   diff=forec[:,0:OUTPUT_WINDOW]-actuals
-  rmse=np.sqrt(np.nanmean(diff*diff, axis=1))
-  mase=np.nanmean(abs(diff), axis=1)/maseNormalizer
-  mape=np.nanmean(abs(diff/actuals), axis=1)
-  bias=np.nanmean(diff/actuals, axis=1)
-  
-  ret[:,0]=rmse
-  ret[:,1]=bias
-  ret[:,2]=mase
-  ret[:,3]=mape
-  
-  #exceedance
-  lower=0; iq=0
-  for iq in range(len(QUANTS)):
-    quant=QUANTS[iq]
-    #print(quant)
-    upper=lower+OUTPUT_WINDOW
-    diff=actuals-forec[:,lower:upper]
+  with warnings.catch_warnings():
+    warnings.simplefilter("ignore", category=RuntimeWarning)
+    rmse=np.sqrt(np.nanmean(diff*diff, axis=1))
+    mase=np.nanmean(abs(diff), axis=1)/maseNormalizer
+    mape=np.nanmean(abs(diff/actuals), axis=1)
+    bias=np.nanmean(diff/actuals, axis=1)
     
-    if quant>=0.5:
-      xceeded=diff>0
-    else:
-      xceeded=diff<0
-        
-    exceeded=np.nanmean(xceeded, axis=1) 
-    ret[:,iq+4]=exceeded
-    lower=upper
+    ret[:,0]=rmse
+    ret[:,1]=bias
+    ret[:,2]=mase
+    ret[:,3]=mape
+    
+    #exceedance
+    lower=0; iq=0
+    for iq in range(len(QUANTS)):
+      quant=QUANTS[iq]
+      #print(quant)
+      upper=lower+OUTPUT_WINDOW
+      diff=actuals-forec[:,lower:upper]
+      
+      if quant>=0.5:
+        xceeded=diff>0
+      else:
+        xceeded=diff<0
+          
+      exceeded=np.nanmean(xceeded, axis=1) 
+      ret[:,iq+4]=exceeded
+      lower=upper
       
   return ret
             
@@ -955,7 +964,7 @@ if __name__ == '__main__' or __name__ == 'builtins':
     exit(-1)
   
   
-  outputDir=OUTPUT_DIR+RUN_SHORT+"/"
+  outputDir=OUTPUT_DIR+SHORT_RUN+"/"
   if workerNumber==1:
     dirExists = os.path.exists(outputDir)
     if not dirExists:
@@ -1026,7 +1035,7 @@ if __name__ == '__main__' or __name__ == 'builtins':
   for series in series_list:
     perSerPars=PerSeriesParams(series, contextSize, device=device)
     perSeriesParams_d[series]=perSerPars
-    perSerTrainer=torch.optim.Adam(perSerPars.parameters(), lr=INITIAL_LEARNING_RATE)
+    perSerTrainer=torch.optim.Adam(perSerPars.parameters(), lr=INITIAL_LEARNING_RATE*PER_SERIES_MULTIP)
     perSeriesTrainers_d[series]=perSerTrainer
 
     
@@ -1074,7 +1083,7 @@ if __name__ == '__main__' or __name__ == 'builtins':
           param_group['lr']=learningRate     
       for series in series_list: 
         for param_group in perSeriesTrainers_d[series].param_groups:
-          param_group['lr']=learningRate
+          param_group['lr']=learningRate*PER_SERIES_MULTIP
       print('changin LR to:', f'{learningRate:.2}' )   
       
     epochTrainingErrors=[];
@@ -1262,6 +1271,8 @@ if __name__ == '__main__' or __name__ == 'builtins':
         #batch level     
         if len(trainingErrors)>0:
           trainer.zero_grad()  
+          for series in ppBatch.series:
+            perSeriesTrainers_d[series].zero_grad() 
             
           avgTrainLoss_t=torch.mean(torch.cat(trainingErrors))    
           assert not torch.isnan(avgTrainLoss_t)  
@@ -1422,11 +1433,11 @@ if __name__ == '__main__' or __name__ == 'builtins':
                 saveTesting=iEpoch>=FIRST_EPOCH_TO_START_SAVING_FORECASTS and \
                   random.choice(range(SAVE_TEST_EVERY_STEP))==0
                 if saveTesting:
-                  if saveVarImportance:
+                  if saveVarImportance and iEpoch>=FIRST_EPOCH_TO_SAVE_IMPORTANCE:
                     keys_ll=[]
                     for series in ppBatch.series:
-                      keys_ll.append([series,str(dat)])
-                    key_df=pd.DataFrame(keys_ll, columns=["series","date"])
+                      keys_ll.append([iEpoch,series,str(dat)])
+                    key_df=pd.DataFrame(keys_ll, columns=["epoch","series","date"])
                     varImportance=rnn.cells[0].varImportance_t.detach().cpu().numpy()
                     v_df = pd.DataFrame(varImportance, columns=varNames)
                     var_df=pd.concat([key_df,v_df],axis=1)
@@ -1475,19 +1486,22 @@ if __name__ == '__main__' or __name__ == 'builtins':
                       if oneDate_df is None:
                         oneDate_df=oneRow_df.copy()
                       else:
-                        oneDate_df=oneDate_df.append(oneRow_df.copy())
+                        #oneDate_df=oneDate_df.append(oneRow_df.copy())
+                        oneDate_df=pd.concat([oneDate_df,oneRow_df.copy()])
                               
                   if not USE_DB:        
                     if oneBatch_df is None:
                       oneBatch_df=oneDate_df.copy() #higher loop is through dates, here only one date per series
                     else:
-                      oneBatch_df=oneBatch_df.append(oneDate_df.copy())
+                      #oneBatch_df=oneBatch_df.append(oneDate_df.copy())
+                      oneBatch_df=pd.concat([oneBatch_df,oneDate_df.copy()])
                               
             if not USE_DB and iEpoch>=FIRST_EPOCH_TO_START_SAVING_FORECASTS:    
               if forecast_df is None:
                 forecast_df=oneBatch_df.copy()
               else:
-                forecast_df=forecast_df.append(oneBatch_df.copy())
+                #forecast_df=forecast_df.append(oneBatch_df.copy())
+                forecast_df=pd.concat([forecast_df,oneBatch_df.copy()])
               #print(forecast_df.shape)
                         
         numOfUpdatesSoFar+=1          
@@ -1695,17 +1709,17 @@ query+=")/"+str(OUTPUT_WINDOW)+" as MPE \n"
 
 for ih in range(1,OUTPUT_WINDOW+1):
   if ih==1:
-    query+=",("
+    query+=",sqrt(("
   else:
     query+=" + "
   query+="(predQ50_"+str(ih)+"-actual"+str(ih)+")*(predQ50_"+str(ih)+"-actual"+str(ih)+")" 
-query+=")/"+str(OUTPUT_WINDOW)+" as MSE \n"  
+query+=")/"+str(OUTPUT_WINDOW)+") as RMSE \n"  
 
 query+="from avgValues),"
 #aggregate over forecasts
 query+="perSeries as (select run, series, epoch, count(*) kount, \n\
  avg(MAPE) MAPE, avg(MPE) pcBias, \n\
- sqrt(avg(MSE)) RMSE,  \n\
+ avg(RMSE) RMSE,  \n\
  avg(exceed50) exceed50, avg(exceed05) exceed05, avg(exceed95) exceed95,  \n\
  count(distinct forecOriginDate) numForecasts, max(workers) workers \n\
  from perForecMetrics \n\
